@@ -1,7 +1,6 @@
 import type {
-  GenericActionCtx,
-  GenericDataModel,
   GenericMutationCtx,
+  GenericDataModel,
   GenericQueryCtx,
 } from "convex/server";
 
@@ -16,11 +15,7 @@ type RunMutationCtx = {
   runMutation: GenericMutationCtx<GenericDataModel>["runMutation"];
 };
 
-type RunActionCtx = {
-  runAction: GenericActionCtx<GenericDataModel>["runAction"];
-};
-
-type FullCtx = RunQueryCtx & RunMutationCtx & RunActionCtx;
+type MetadataCtx = RunQueryCtx & RunMutationCtx;
 
 export type S3Config = {
   endpoint: string;
@@ -43,24 +38,72 @@ export type QueryResult = {
   row_count: number;
 };
 
-export class DuckDB {
-  private component: ComponentApi;
-  private s3Config: S3Config;
+export type DuckDBClientOptions = {
+  /**
+   * Default timeout for sidecar HTTP requests (ms). Used if per-operation
+   * timeouts are not provided.
+   */
+  timeoutMs?: number;
+  /** Timeout for snapshot requests (ms). Overrides `timeoutMs` when set. */
+  snapshotTimeoutMs?: number;
+  /** Timeout for query requests (ms). Overrides `timeoutMs` when set. */
+  queryTimeoutMs?: number;
+};
 
-  constructor(component: ComponentApi, s3Config: S3Config) {
-    this.component = component;
-    this.s3Config = s3Config;
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  // Node 18+ supports AbortController. If unavailable, we still perform the
+  // request without a timeout.
+  const AbortControllerAny = (globalThis as any).AbortController as
+    | (new () => AbortController)
+    | undefined;
+  if (!AbortControllerAny || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return await fetch(url, init);
   }
 
-  private get s3Args() {
-    return {
-      s3_endpoint: this.s3Config.endpoint,
-      s3_bucket: this.s3Config.bucket,
-      s3_region: this.s3Config.region,
-      s3_access_key_id: this.s3Config.accessKeyId,
-      s3_secret_access_key: this.s3Config.secretAccessKey,
-      s3_force_path_style: this.s3Config.forcePathStyle,
-    };
+  const controller = new AbortControllerAny();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      msg.includes("aborted") ||
+      msg.includes("AbortError") ||
+      // Undici sometimes throws with this code.
+      (err as any)?.name === "AbortError"
+    ) {
+      throw new Error(`Sidecar request timed out after ${timeoutMs}ms: ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export class DuckDBClient {
+  private component: ComponentApi;
+  private sidecarURL: string;
+  private s3Config: S3Config;
+  private snapshotTimeoutMs: number;
+  private queryTimeoutMs: number;
+
+  constructor(
+    component: ComponentApi,
+    sidecarURL: string,
+    s3Config: S3Config,
+    opts?: DuckDBClientOptions,
+  ) {
+    this.component = component;
+    this.sidecarURL = sidecarURL.replace(/\/$/, "");
+    this.s3Config = s3Config;
+
+    const defaultTimeoutMs = opts?.timeoutMs ?? 120_000;
+    this.snapshotTimeoutMs = opts?.snapshotTimeoutMs ?? defaultTimeoutMs;
+    this.queryTimeoutMs = opts?.queryTimeoutMs ?? defaultTimeoutMs;
   }
 
   /**
@@ -98,16 +141,16 @@ export class DuckDB {
   }
 
   /**
-   * Snapshot data to S3 as Parquet in one shot.
+   * Snapshot data to S3 as Parquet via the sidecar service.
    * Consumer fetches their own data and passes it here.
    */
   async snapshot(
-    ctx: FullCtx,
+    ctx: MetadataCtx,
     args: {
       tableName: string;
       data: Record<string, unknown>[];
     },
-  ): Promise<{ s3Key: string; rowCount: number }> {
+  ): Promise<{ s3Key: string; rowCount: number; parquetSizeBytes: number }> {
     // Get table config
     const table = await ctx.runQuery(this.component.lib.getRegisteredTable, {
       table_name: args.tableName,
@@ -122,56 +165,72 @@ export class DuckDB {
       { table_name: args.tableName },
     );
 
-    // Run action to write Parquet to S3
-    const result = await ctx.runAction(this.component.actions.snapshotToS3, {
+    // Mark as writing
+    await ctx.runMutation(this.component.lib.updateSnapshot, {
       snapshot_id: snapshotId,
-      table_name: args.tableName,
-      data: args.data,
-      columns: table.columns,
-      s3_key_prefix: table.s3_key_prefix,
-      ...this.s3Args,
+      status: "writing" as const,
     });
 
-    return { s3Key: result.s3_key, rowCount: result.row_count };
-  }
+    const timestamp = Date.now();
+    const s3Key = `${table.s3_key_prefix}/${timestamp}.parquet`;
 
-  /**
-   * Start a chunked snapshot for large tables.
-   * Returns a snapshot context to use with appendChunk/finalizeSnapshot.
-   */
-  async startSnapshot(
-    ctx: RunQueryCtx & RunMutationCtx,
-    tableName: string,
-  ): Promise<ChunkedSnapshot> {
-    const table = await ctx.runQuery(this.component.lib.getRegisteredTable, {
-      table_name: tableName,
-    });
-    if (!table) {
-      throw new Error(`Table "${tableName}" is not registered`);
+    try {
+      // Call sidecar to write Parquet to S3
+      const response = await fetchWithTimeout(
+        `${this.sidecarURL}/snapshot`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            table_name: args.tableName,
+            data: args.data,
+            columns: table.columns,
+            s3_key: s3Key,
+            s3_config: this.s3Config,
+          }),
+        },
+        this.snapshotTimeoutMs,
+      );
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: response.statusText }));
+        throw new Error(`Sidecar snapshot failed: ${(err as any).error ?? response.statusText}`);
+      }
+
+      const result = (await response.json()) as {
+        s3_key: string;
+        row_count: number;
+        parquet_size_bytes: number;
+      };
+
+      // Mark complete
+      await ctx.runMutation(this.component.lib.updateSnapshot, {
+        snapshot_id: snapshotId,
+        status: "complete" as const,
+        s3_key: result.s3_key,
+        row_count: result.row_count,
+      });
+
+      return {
+        s3Key: result.s3_key,
+        rowCount: result.row_count,
+        parquetSizeBytes: result.parquet_size_bytes,
+      };
+    } catch (error) {
+      await ctx.runMutation(this.component.lib.updateSnapshot, {
+        snapshot_id: snapshotId,
+        status: "failed" as const,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
     }
-
-    const snapshotId = await ctx.runMutation(
-      this.component.lib.createSnapshot,
-      { table_name: tableName },
-    );
-
-    return new ChunkedSnapshot(
-      this.component,
-      this.s3Args,
-      this.s3Config.bucket,
-      snapshotId,
-      tableName,
-      table.columns,
-      table.s3_key_prefix,
-    );
   }
 
   /**
-   * Run a SQL query over snapshotted Parquet data.
-   * By default queries all registered tables, or specify table names.
+   * Run a SQL query over snapshotted Parquet data via the sidecar service.
    */
   async query(
-    ctx: FullCtx,
+    ctx: RunQueryCtx,
     args: {
       sql: string;
       tableNames?: string[];
@@ -192,44 +251,52 @@ export class DuckDB {
     }
 
     // Get S3 paths for each table (latest snapshot or chunk glob)
-    const tableS3Paths: { table_name: string; s3_path: string }[] = [];
+    const tables: { name: string; s3_path: string }[] = [];
     for (const tableName of tableNames) {
-      const table = await ctx.runQuery(
-        this.component.lib.getRegisteredTable,
-        { table_name: tableName },
-      );
-      if (!table) continue;
-
       const snapshot = await ctx.runQuery(
         this.component.lib.getLatestSnapshot,
         { table_name: tableName },
       );
       if (!snapshot?.s3_key) continue;
 
-      // If the snapshot has chunks, use a glob pattern
       if (snapshot.chunk_count && snapshot.chunk_count > 0) {
-        const chunkDir = snapshot.s3_key;
-        tableS3Paths.push({
-          table_name: tableName,
-          s3_path: `${chunkDir}/*.parquet`,
+        tables.push({
+          name: tableName,
+          s3_path: `${snapshot.s3_key}/*.parquet`,
         });
       } else {
-        tableS3Paths.push({
-          table_name: tableName,
+        tables.push({
+          name: tableName,
           s3_path: snapshot.s3_key,
         });
       }
     }
 
-    if (tableS3Paths.length === 0) {
+    if (tables.length === 0) {
       return { columns: [], rows: [], row_count: 0 };
     }
 
-    return await ctx.runAction(this.component.actions.queryDuckDB, {
-      sql: args.sql,
-      table_s3_paths: tableS3Paths,
-      ...this.s3Args,
-    });
+    // Call sidecar to execute SQL
+    const response = await fetchWithTimeout(
+      `${this.sidecarURL}/query`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sql: args.sql,
+          tables,
+          s3_config: this.s3Config,
+        }),
+      },
+      this.queryTimeoutMs,
+    );
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ error: response.statusText }));
+      throw new Error(`Sidecar query failed: ${(err as any).error ?? response.statusText}`);
+    }
+
+    return (await response.json()) as QueryResult;
   }
 
   /**
@@ -255,64 +322,5 @@ export class DuckDB {
   }
 }
 
-/**
- * Handles chunked snapshots for large tables.
- * Use with DuckDB.startSnapshot().
- */
-export class ChunkedSnapshot {
-  private chunkIndex = 0;
-  private totalRows = 0;
-  private chunkKeys: string[] = [];
-
-  constructor(
-    private component: ComponentApi,
-    private s3Args: Record<string, unknown>,
-    private bucket: string,
-    public readonly snapshotId: string,
-    public readonly tableName: string,
-    private columns: ColumnMapping[],
-    private s3KeyPrefix: string,
-  ) {}
-
-  /**
-   * Append a chunk of data. Call this in a loop as you paginate.
-   */
-  async appendChunk(
-    ctx: RunActionCtx,
-    data: Record<string, unknown>[],
-  ): Promise<{ s3Key: string; rowCount: number }> {
-    const result = await ctx.runAction(
-      this.component.actions.snapshotChunkToS3,
-      {
-        snapshot_id: this.snapshotId,
-        table_name: this.tableName,
-        data,
-        columns: this.columns,
-        s3_key_prefix: this.s3KeyPrefix,
-        chunk_index: this.chunkIndex,
-        ...this.s3Args,
-      },
-    );
-
-    this.chunkIndex++;
-    this.totalRows += result.row_count;
-    this.chunkKeys.push(result.s3_key);
-
-    return { s3Key: result.s3_key, rowCount: result.row_count };
-  }
-
-  /**
-   * Finalize the chunked snapshot. Marks it complete with metadata.
-   */
-  async finalize(ctx: RunMutationCtx): Promise<void> {
-    // The s3_key for chunked snapshots stores the chunk directory prefix
-    const chunkDir = `${this.s3KeyPrefix}/chunks/${this.snapshotId}`;
-    await ctx.runMutation(this.component.lib.updateSnapshot, {
-      snapshot_id: this.snapshotId,
-      status: "complete",
-      s3_key: chunkDir,
-      row_count: this.totalRows,
-      chunk_count: this.chunkIndex,
-    });
-  }
-}
+// Re-export old name for backwards compatibility during transition
+export { DuckDBClient as DuckDB };

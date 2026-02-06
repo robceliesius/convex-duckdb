@@ -16,21 +16,52 @@ export const registerTable = mutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
+    const tableName = args.table_name.trim();
+    if (!tableName) {
+      throw new Error("table_name must be non-empty");
+    }
+    if (args.columns.length === 0) {
+      throw new Error("columns must be non-empty");
+    }
+
+    const s3KeyPrefix =
+      args.s3_key_prefix === undefined ? undefined : args.s3_key_prefix.trim();
+    if (args.s3_key_prefix !== undefined && !s3KeyPrefix) {
+      throw new Error("s3_key_prefix must be non-empty when provided");
+    }
+
+    // Normalize/validate columns and ensure Parquet column names are unique.
+    const seen = new Set<string>();
+    const columns = args.columns.map((c) => {
+      const source = c.source.trim();
+      if (!source) throw new Error("columns[].source must be non-empty");
+      const target = c.target.trim();
+      if (!target) throw new Error("columns[].target must be non-empty");
+      const type = c.type.trim();
+      if (!type) throw new Error("columns[].type must be non-empty");
+      if (seen.has(target)) {
+        throw new Error(`duplicate columns[].target: "${target}"`);
+      }
+      seen.add(target);
+      return { source, target, type };
+    });
+
     const existing = await ctx.db
       .query("registered_tables")
-      .withIndex("by_table_name", (q) => q.eq("table_name", args.table_name))
+      .withIndex("by_table_name", (q) => q.eq("table_name", tableName))
       .first();
 
     if (existing) {
       await ctx.db.patch(existing._id, {
-        columns: args.columns,
-        s3_key_prefix: args.s3_key_prefix ?? args.table_name,
+        columns,
+        // Do not change the prefix unless explicitly provided.
+        s3_key_prefix: s3KeyPrefix ?? existing.s3_key_prefix,
       });
     } else {
       await ctx.db.insert("registered_tables", {
-        table_name: args.table_name,
-        columns: args.columns,
-        s3_key_prefix: args.s3_key_prefix ?? args.table_name,
+        table_name: tableName,
+        columns,
+        s3_key_prefix: s3KeyPrefix ?? tableName,
       });
     }
     return null;
@@ -57,9 +88,11 @@ export const getRegisteredTable = query({
     v.null(),
   ),
   handler: async (ctx, args) => {
+    const tableName = args.table_name.trim();
+    if (!tableName) return null;
     return await ctx.db
       .query("registered_tables")
-      .withIndex("by_table_name", (q) => q.eq("table_name", args.table_name))
+      .withIndex("by_table_name", (q) => q.eq("table_name", tableName))
       .first();
   },
 });
@@ -94,8 +127,12 @@ export const createSnapshot = mutation({
   },
   returns: v.id("snapshots"),
   handler: async (ctx, args) => {
+    const tableName = args.table_name.trim();
+    if (!tableName) {
+      throw new Error("table_name must be non-empty");
+    }
     return await ctx.db.insert("snapshots", {
-      table_name: args.table_name,
+      table_name: tableName,
       status: "pending",
       created_at: Date.now(),
     });
@@ -148,10 +185,12 @@ export const getLatestSnapshot = query({
     v.null(),
   ),
   handler: async (ctx, args) => {
+    const tableName = args.table_name.trim();
+    if (!tableName) return null;
     return await ctx.db
       .query("snapshots")
       .withIndex("by_table_name_and_status", (q) =>
-        q.eq("table_name", args.table_name).eq("status", "complete"),
+        q.eq("table_name", tableName).eq("status", "complete"),
       )
       .order("desc")
       .first();
@@ -181,10 +220,12 @@ export const listSnapshots = query({
   handler: async (ctx, args) => {
     const limit = args.limit ?? 20;
     if (args.table_name) {
+      const tableName = args.table_name.trim();
+      if (!tableName) return [];
       return await ctx.db
         .query("snapshots")
         .withIndex("by_table_name", (q) =>
-          q.eq("table_name", args.table_name!),
+          q.eq("table_name", tableName),
         )
         .order("desc")
         .take(limit);

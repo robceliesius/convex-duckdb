@@ -1,0 +1,96 @@
+# @robceliesius/convex-duckdb
+
+DuckDB-powered SQL analytics for Convex apps. Export Convex data as Parquet files to S3/MinIO, then run SQL queries over it without touching your production database.
+
+## Install
+
+npm install @robceliesius/convex-duckdb
+
+Requires: convex ^1.24.0, a DuckDB sidecar service, S3-compatible storage.
+
+## Setup
+
+### 1. Register the component
+
+```ts
+// convex/convex.config.ts
+import { defineApp } from "convex/server";
+import duckdb from "@robceliesius/convex-duckdb/convex.config";
+const app = defineApp();
+app.use(duckdb);
+export default app;
+```
+
+### 2. Run the sidecar + configure Convex env
+
+You must run an HTTP sidecar service (Parquet writes + DuckDB queries) and configure Convex runtime env so Node UDFs can reach it.
+
+Convex env vars to set:
+- `DUCKDB_SIDECAR_URL`
+- `S3_ENDPOINT_URL`
+- `ANALYTICS_S3_BUCKET`
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`
+
+### 3. Create a client (in a "use node" file)
+
+```ts
+import { DuckDBClient } from "@robceliesius/convex-duckdb";
+import { components } from "../_generated/api";
+
+const client = new DuckDBClient(
+  components.duckdb,
+  process.env.DUCKDB_SIDECAR_URL ?? "http://localhost:3214",
+  {
+    endpoint: process.env.S3_ENDPOINT_URL!,
+    bucket: process.env.ANALYTICS_S3_BUCKET!,
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+    forcePathStyle: true,
+  },
+  { timeoutMs: 120_000 }, // optional (defaults to 120s)
+);
+```
+
+## Operational Notes / Gotchas
+
+- DuckDB sidecar Docker images: avoid Alpine. DuckDB uses native bindings and Alpine frequently fails with `ERR_DLOPEN_FAILED` (missing `ld-linux-*`). Prefer Debian/Ubuntu (e.g. `node:*-bookworm-slim`).
+- `DUCKDB_SIDECAR_URL` must be reachable from the Convex Node UDF runtime (not just from your laptop). Docker-only hostnames may not resolve depending on your self-host setup.
+- If multiple MinIO containers share DNS aliases like `minio` on the same Docker network, uploads can go to one MinIO while queries read from another, producing intermittent `404` for Parquet URLs. Use an unambiguous `S3_ENDPOINT_URL`.
+- DuckDB S3 setting name is `s3_secret_access_key` (not `s3_secret_key`).
+
+## API
+
+### DuckDBClient
+
+Constructor: `new DuckDBClient(component, sidecarURL, s3Config, opts?)`
+
+Timeouts (ms):
+- default: `timeoutMs` (defaults to 120_000)
+- overrides: `snapshotTimeoutMs`, `queryTimeoutMs`
+
+Methods:
+- `registerTable(ctx, { tableName, columns, s3KeyPrefix? })` — Register a table with column mappings
+- `snapshot(ctx, { tableName, data })` — Export data array as Parquet to S3. Returns `{ s3Key, rowCount, parquetSizeBytes }`
+- `query(ctx, { sql, tableNames? })` — Run SQL over latest Parquet snapshots. Returns `{ columns, rows, row_count }`
+- `getRegisteredTable(ctx, tableName)` — Get table config
+- `listRegisteredTables(ctx)` — List all registered tables
+- `getLatestSnapshot(ctx, tableName)` — Get latest snapshot metadata
+- `listSnapshots(ctx, { tableName?, limit? })` — List snapshot history
+
+### S3Config
+
+```ts
+{ endpoint: string, bucket: string, region?: string, accessKeyId: string, secretAccessKey: string, forcePathStyle?: boolean }
+```
+
+### ColumnMapping
+
+```ts
+{ source: string, target: string, type: "VARCHAR" | "INTEGER" | "BIGINT" | "DOUBLE" | "BOOLEAN" }
+```
+
+## Architecture
+
+Component (runs in Convex) stores metadata only. DuckDB sidecar (separate HTTP service) handles Parquet conversion and SQL execution. This separation exists because Convex components cannot use native Node.js dependencies.
+
+Sidecar repo: https://github.com/robceliesius/convex-duckdb-sidecar

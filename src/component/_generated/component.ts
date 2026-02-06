@@ -15,63 +15,6 @@ import type { FunctionReference } from "convex/server";
  */
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
-    actions: {
-      queryDuckDB: FunctionReference<
-        "action",
-        "internal",
-        {
-          s3_access_key_id: string;
-          s3_bucket: string;
-          s3_endpoint: string;
-          s3_force_path_style?: boolean;
-          s3_region?: string;
-          s3_secret_access_key: string;
-          sql: string;
-          table_s3_paths: Array<{ s3_path: string; table_name: string }>;
-        },
-        { columns: Array<string>; row_count: number; rows: Array<any> },
-        Name
-      >;
-      snapshotChunkToS3: FunctionReference<
-        "action",
-        "internal",
-        {
-          chunk_index: number;
-          columns: Array<{ source: string; target: string; type: string }>;
-          data: Array<any>;
-          s3_access_key_id: string;
-          s3_bucket: string;
-          s3_endpoint: string;
-          s3_force_path_style?: boolean;
-          s3_key_prefix: string;
-          s3_region?: string;
-          s3_secret_access_key: string;
-          snapshot_id: string;
-          table_name: string;
-        },
-        { row_count: number; s3_key: string },
-        Name
-      >;
-      snapshotToS3: FunctionReference<
-        "action",
-        "internal",
-        {
-          columns: Array<{ source: string; target: string; type: string }>;
-          data: Array<any>;
-          s3_access_key_id: string;
-          s3_bucket: string;
-          s3_endpoint: string;
-          s3_force_path_style?: boolean;
-          s3_key_prefix: string;
-          s3_region?: string;
-          s3_secret_access_key: string;
-          snapshot_id: string;
-          table_name: string;
-        },
-        { row_count: number; s3_key: string },
-        Name
-      >;
-    };
     lib: {
       createSnapshot: FunctionReference<
         "mutation",
