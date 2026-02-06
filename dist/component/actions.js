@@ -2,8 +2,15 @@
 import { action } from "./_generated/server.js";
 import { api } from "./_generated/api.js";
 import { v } from "convex/values";
-import { Database } from "duckdb-async";
-import { S3Client, PutObjectCommand, } from "@aws-sdk/client-s3";
+// Dynamic imports to avoid esbuild trying to bundle native deps at build time
+async function getDuckDB() {
+    const { Database } = await import("duckdb-async");
+    return Database;
+}
+async function getS3Deps() {
+    const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
+    return { S3Client, PutObjectCommand };
+}
 const s3ConfigArgs = {
     s3_endpoint: v.string(),
     s3_bucket: v.string(),
@@ -12,7 +19,8 @@ const s3ConfigArgs = {
     s3_secret_access_key: v.string(),
     s3_force_path_style: v.optional(v.boolean()),
 };
-function createS3Client(args) {
+async function createS3Client(args) {
+    const { S3Client } = await getS3Deps();
     return new S3Client({
         endpoint: args.s3_endpoint,
         region: args.s3_region ?? "us-east-1",
@@ -24,6 +32,7 @@ function createS3Client(args) {
     });
 }
 async function setupDuckDB(args) {
+    const Database = await getDuckDB();
     const db = await Database.create(":memory:");
     await db.run("INSTALL httpfs; LOAD httpfs;");
     await db.run(`SET s3_endpoint='${args.s3_endpoint.replace(/^https?:\/\//, "")}';`);
@@ -53,7 +62,9 @@ export const snapshotToS3 = action({
         row_count: v.number(),
     }),
     handler: async (ctx, args) => {
-        const s3 = createS3Client(args);
+        const s3 = await createS3Client(args);
+        const { PutObjectCommand } = await getS3Deps();
+        const Database = await getDuckDB();
         const timestamp = Date.now();
         const s3Key = `${args.s3_key_prefix}/${timestamp}.parquet`;
         try {
@@ -136,7 +147,9 @@ export const snapshotChunkToS3 = action({
         row_count: v.number(),
     }),
     handler: async (ctx, args) => {
-        const s3 = createS3Client(args);
+        const s3 = await createS3Client(args);
+        const { PutObjectCommand } = await getS3Deps();
+        const Database = await getDuckDB();
         const snapshotDoc = args.snapshot_id.toString();
         const s3Key = `${args.s3_key_prefix}/chunks/${snapshotDoc}/chunk_${String(args.chunk_index).padStart(6, "0")}.parquet`;
         const db = await Database.create(":memory:");
