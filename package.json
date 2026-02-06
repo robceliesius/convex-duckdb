@@ -1,6 +1,6 @@
 {
   "name": "@robceliesius/convex-duckdb",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "description": "Convex component providing DuckDB-powered analytics over Convex data with S3/Minio Parquet storage via sidecar service.",
   "type": "module",
   "scripts": {

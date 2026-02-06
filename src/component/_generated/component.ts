@@ -76,5 +76,19 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         null,
         Name
       >;
+      deleteSnapshot: FunctionReference<
+        "mutation",
+        "internal",
+        { snapshot_id: string },
+        null,
+        Name
+      >;
+      deleteRegisteredTable: FunctionReference<
+        "mutation",
+        "internal",
+        { table_name: string },
+        { deleted_snapshots: number },
+        Name
+      >;
     };
   };

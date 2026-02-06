@@ -233,3 +233,43 @@ export const listSnapshots = query({
     return await ctx.db.query("snapshots").order("desc").take(limit);
   },
 });
+
+// Delete a snapshot by ID
+export const deleteSnapshot = mutation({
+  args: { snapshot_id: v.id("snapshots") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.db.delete(args.snapshot_id);
+    return null;
+  },
+});
+
+// Delete a registered table by name (and all its snapshots)
+export const deleteRegisteredTable = mutation({
+  args: { table_name: v.string() },
+  returns: v.object({ deleted_snapshots: v.number() }),
+  handler: async (ctx, args) => {
+    const tableName = args.table_name.trim();
+    if (!tableName) throw new Error("table_name must be non-empty");
+
+    // Delete all snapshots for this table
+    const snapshots = await ctx.db
+      .query("snapshots")
+      .withIndex("by_table_name", (q) => q.eq("table_name", tableName))
+      .collect();
+    for (const s of snapshots) {
+      await ctx.db.delete(s._id);
+    }
+
+    // Delete the table registration
+    const table = await ctx.db
+      .query("registered_tables")
+      .withIndex("by_table_name", (q) => q.eq("table_name", tableName))
+      .first();
+    if (table) {
+      await ctx.db.delete(table._id);
+    }
+
+    return { deleted_snapshots: snapshots.length };
+  },
+});
