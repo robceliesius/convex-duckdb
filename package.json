@@ -32,13 +32,13 @@
   "types": "./dist/client/index.d.ts",
   "module": "./dist/client/index.js",
   "peerDependencies": {
-    "convex": "^1.24.0"
+    "convex": "1.24.0"
   },
   "devDependencies": {
-    "chokidar-cli": "^3.0.0",
-    "convex": "^1.29.3",
-    "typescript": "^5.5.0",
-    "@types/node": "^20.0.0"
+    "chokidar-cli": "3.0.0",
+    "convex": "1.29.3",
+    "typescript": "5.5.0",
+    "@types/node": "20.0.0"
   },
   "license": "MIT"
 }
